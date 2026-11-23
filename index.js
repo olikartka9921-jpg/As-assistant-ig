@@ -1,134 +1,160 @@
-/**
- * User-to-Assistant Role Switcher
- *
- * Changes only the newest user message in the outgoing generation prompt
- * to an assistant-role message. The chat-history object is not modified:
- * the message is cloned before its role flags are changed.
- */
+(() => {
+    "use strict";
 
-const MODULE_NAME = 'user_to_assistant_role_switcher';
+    const EXTENSION_KEY = "user_messages_as_assistant";
+    const STORAGE_KEY = "st_user_messages_as_assistant_settings";
+    const DEFAULT_SETTINGS = {
+        enabled: true,
+        scope: "all" // "all" or "latest"
+    };
 
-const DEFAULT_SETTINGS = Object.freeze({
-    enabled: true,
-    debug: false,
-});
-
-function getSettings() {
-    const context = SillyTavern.getContext();
-
-    if (!context.extensionSettings[MODULE_NAME]) {
-        context.extensionSettings[MODULE_NAME] = structuredClone(DEFAULT_SETTINGS);
-    }
-
-    for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-        if (!Object.hasOwn(context.extensionSettings[MODULE_NAME], key)) {
-            context.extensionSettings[MODULE_NAME][key] = value;
+    function loadSettings() {
+        try {
+            const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+            return { ...DEFAULT_SETTINGS, ...saved };
+        } catch (error) {
+            console.warn("[User Messages as Assistant] Could not read settings; using defaults.", error);
+            return { ...DEFAULT_SETTINGS };
         }
     }
 
-    return context.extensionSettings[MODULE_NAME];
-}
+    let settings = loadSettings();
 
-/**
- * SillyTavern calls this before building/sending a generation prompt.
- * `chat` is the prompt's message array.
- */
-globalThis.convertLatestUserToAssistant = async function (chat, contextSize, abort, type) {
-    const settings = getSettings();
-
-    if (!settings.enabled || !Array.isArray(chat) || chat.length === 0) {
-        return;
-    }
-
-    // Find the newest actual user message. Do not convert older user turns.
-    let targetIndex = -1;
-
-    for (let i = chat.length - 1; i >= 0; i--) {
-        const message = chat[i];
-
-        if (message && message.is_user === true && message.is_system !== true) {
-            targetIndex = i;
-            break;
+    function saveSettings() {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+        } catch (error) {
+            console.error("[User Messages as Assistant] Could not save settings.", error);
         }
     }
 
-    if (targetIndex === -1) {
-        return;
-    }
+    /**
+     * SillyTavern calls this before generation with the outgoing chat context.
+     * The interceptor edits this prompt-context array, not the persisted chat
+     * messages displayed in the conversation.
+     */
+    globalThis.userMessagesAsAssistantInterceptor = function (chat, contextSize, abort, type) {
+        if (!settings.enabled || !Array.isArray(chat) || chat.length === 0) {
+            return;
+        }
 
-    // Clone before editing so the saved/displayed chat history stays intact.
-    const convertedMessage = structuredClone(chat[targetIndex]);
-    convertedMessage.is_user = false;
-    convertedMessage.is_system = false;
+        // Role conversion is meaningful for Chat Completion APIs. In Text
+        // Completion mode, messages are flattened into one text prompt.
+        // SillyTavern's main_api values vary by version/fork, so explicitly
+        // skip the well-known Text Completion backends.
+        let context = {};
+        try {
+            context = SillyTavern.getContext?.() || {};
+        } catch (_) {
+            context = {};
+        }
 
-    chat[targetIndex] = convertedMessage;
+        const api = String(context.main_api || "").toLowerCase();
+        const textCompletionApis = new Set([
+            "kobold", "koboldcpp", "novel", "textgenerationwebui",
+            "ooba", "tabby", "aphrodite", "llamacpp", "llamacpp"
+        ]);
+        if (textCompletionApis.has(api)) {
+            return;
+        }
 
-    if (settings.debug) {
-        console.info(
-            `[${MODULE_NAME}] Converted newest user message to assistant role.`,
-            { index: targetIndex, generationType: type ?? 'unknown' },
+        const userMessages = [];
+        for (let i = 0; i < chat.length; i++) {
+            const message = chat[i];
+            if (message && message.is_user === true && message.is_system !== true) {
+                userMessages.push(message);
+            }
+        }
+
+        if (userMessages.length === 0) {
+            return;
+        }
+
+        const targets = settings.scope === "latest"
+            ? [userMessages[userMessages.length - 1]]
+            : userMessages;
+
+        for (const message of targets) {
+            // In SillyTavern's chat-context format, is_user=false and
+            // is_system=false represent an assistant/character message.
+            message.is_user = false;
+            message.is_system = false;
+        }
+
+        console.debug(
+            `[User Messages as Assistant] Converted ${targets.length} user message(s) in outgoing context.`
         );
-    }
-};
+    };
 
-// Add a small settings panel to Extensions.
-function renderSettings() {
-    const container = document.getElementById('extensions_settings2');
+    function addSettingsUi() {
+        const $ = window.jQuery;
+        if (!$) {
+            console.warn("[User Messages as Assistant] jQuery not available; settings UI was not added.");
+            return;
+        }
 
-    if (!container || document.getElementById(`${MODULE_NAME}_settings`)) {
-        return;
-    }
+        const $container = $("#extensions_settings");
+        if (!$container.length || $(`#${EXTENSION_KEY}_settings`).length) {
+            return;
+        }
 
-    const settings = getSettings();
-    const panel = document.createElement('div');
-    panel.id = `${MODULE_NAME}_settings`;
-    panel.className = 'extension_settings';
-
-    panel.innerHTML = `
-        <div class="inline-drawer">
-            <div class="inline-drawer-toggle inline-drawer-header">
-                <b>User-to-Assistant Role Switcher</b>
-                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        const html = `
+            <div id="${EXTENSION_KEY}_settings" class="extension_block">
+                <div class="inline-drawer">
+                    <div class="inline-drawer-toggle inline-drawer-header">
+                        <b>User Messages as Assistant</b>
+                        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down"></div>
+                    </div>
+                    <div class="inline-drawer-content">
+                        <label class="checkbox_label">
+                            <input id="${EXTENSION_KEY}_enabled" type="checkbox">
+                            <span>Enable role conversion</span>
+                        </label>
+                        <small class="notes">
+                            Changes message roles in the outgoing generation context only.
+                            Your visible chat history is not rewritten.
+                        </small>
+                        <label for="${EXTENSION_KEY}_scope" class="marginTop5">Messages to convert</label>
+                        <select id="${EXTENSION_KEY}_scope" class="text_pole">
+                            <option value="all">All user messages in the prompt</option>
+                            <option value="latest">Only the latest user message</option>
+                        </select>
+                        <small class="notes">
+                            Recommended: convert all messages so the conversation history
+                            keeps a consistent role interpretation.
+                        </small>
+                    </div>
+                </div>
             </div>
-            <div class="inline-drawer-content">
-                <label class="checkbox_label">
-                    <input id="${MODULE_NAME}_enabled" type="checkbox">
-                    <span>Convert newest user message to Assistant role</span>
-                </label>
-                <label class="checkbox_label">
-                    <input id="${MODULE_NAME}_debug" type="checkbox">
-                    <span>Enable debug logging in browser console</span>
-                </label>
-                <small>
-                    Only the newest user message in each outgoing prompt is converted.
-                    Your saved chat history is left unchanged.
-                </small>
-            </div>
-        </div>
-    `;
+        `;
 
-    container.appendChild(panel);
+        $container.append(html);
+        $(`#${EXTENSION_KEY}_enabled`).prop("checked", settings.enabled);
+        $(`#${EXTENSION_KEY}_scope`).val(settings.scope);
 
-    const enabledInput = panel.querySelector(`#${MODULE_NAME}_enabled`);
-    const debugInput = panel.querySelector(`#${MODULE_NAME}_debug`);
+        $(`#${EXTENSION_KEY}_enabled`).on("change", function () {
+            settings.enabled = this.checked;
+            saveSettings();
+        });
 
-    enabledInput.checked = settings.enabled;
-    debugInput.checked = settings.debug;
+        $(`#${EXTENSION_KEY}_scope`).on("change", function () {
+            settings.scope = this.value === "latest" ? "latest" : "all";
+            saveSettings();
+        });
+    }
 
-    enabledInput.addEventListener('change', () => {
-        getSettings().enabled = enabledInput.checked;
-        SillyTavern.getContext().saveSettingsDebounced();
-        console.info(`[${MODULE_NAME}] ${enabledInput.checked ? 'Enabled' : 'Disabled'}.`);
-    });
+    // The extension script is loaded after the page has started. Retry briefly
+    // because mobile forks can build the Extensions panel later than desktop ST.
+    function init(attempt = 0) {
+        addSettingsUi();
+        if (!document.querySelector(`#${EXTENSION_KEY}_settings`) && attempt < 20) {
+            setTimeout(() => init(attempt + 1), 500);
+        }
+    }
 
-    debugInput.addEventListener('change', () => {
-        getSettings().debug = debugInput.checked;
-        SillyTavern.getContext().saveSettingsDebounced();
-    });
-}
-
-const context = SillyTavern.getContext();
-context.eventSource.on(context.event_types.APP_READY, renderSettings);
-
-// Also attempt once immediately in case the extension loads after APP_READY.
-renderSettings();
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", () => init(), { once: true });
+    } else {
+        init();
+    }
+})();
