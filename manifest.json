@@ -1,0 +1,10 @@
+{
+  "display_name": "User-to-Assistant Role Switcher",
+  "loading_order": 10,
+  "js": "index.js",
+  "author": "Personal extension",
+  "version": "1.0.0",
+  "homePage": "https://github.com/your-username/user-to-assistant-role-switcher",
+  "auto_update": true,
+  "generate_interceptor": "convertLatestUserToAssistant"
+}
